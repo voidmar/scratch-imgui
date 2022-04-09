@@ -344,7 +344,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 DXGI_FRAME_STATISTICS frame_stats;
                 g_pSwapChain->GetFrameStatistics(&frame_stats);
 
-                g_requestedDrawCursorOnFrame = frame_stats.PresentCount + 3;
+                g_requestedDrawCursorOnFrame = frame_stats.PresentCount;
             }
         }
         io.MouseDrawCursor = wantDrawCursor;
