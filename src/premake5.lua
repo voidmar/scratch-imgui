@@ -1,8 +1,8 @@
 project "scratch-imgui"
     location "."
     language "C++"
-    kind "ConsoleApp"
-    --entrypoint "mainCRTStartup"
+    kind "WindowedApp"
+    entrypoint "mainCRTStartup"
 
     files
     {
@@ -12,4 +12,6 @@ project "scratch-imgui"
 
     links
     {
+        "d3d11",
+        "imgui",
     }
