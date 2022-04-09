@@ -5,20 +5,29 @@
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
+#include <dxgi1_6.h>
 #include <d3d11.h>
 #include <tchar.h>
+
+#include <wrl.h>
+using Microsoft::WRL::ComPtr;
 
 // Data
 static ID3D11Device*            g_pd3dDevice = NULL;
 static ID3D11DeviceContext*     g_pd3dDeviceContext = NULL;
-static IDXGISwapChain*          g_pSwapChain = NULL;
+static IDXGISwapChain2*         g_pSwapChain = NULL;
 static ID3D11RenderTargetView*  g_mainRenderTargetView = NULL;
+static bool                     g_presentLoopReady = false;
+static bool                     g_repaintOnInput = false;
+static int                      g_requestedDrawCursor = 0;
+static int                      g_requestedDrawCursorOnFrame = 0;
 
 // Forward declarations of helper functions
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
 void CleanupRenderTarget();
+void RunPresentLoopOnce();
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // Main code
@@ -37,10 +46,6 @@ int main(int, char**)
         ::UnregisterClass(wc.lpszClassName, wc.hInstance);
         return 1;
     }
-
-    // Show the window
-    ::ShowWindow(hwnd, SW_SHOWDEFAULT);
-    ::UpdateWindow(hwnd);
 
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
@@ -72,10 +77,13 @@ int main(int, char**)
     //ImFont* font = io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\ArialUni.ttf", 18.0f, NULL, io.Fonts->GetGlyphRangesJapanese());
     //IM_ASSERT(font != NULL);
 
-    // Our state
-    bool show_demo_window = true;
-    bool show_another_window = false;
-    ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
+    // Prepare frame 0
+    g_presentLoopReady = true;
+    RunPresentLoopOnce();
+
+    // Show the window
+    ::ShowWindow(hwnd, SW_SHOWDEFAULT);
+    ::UpdateWindow(hwnd);
 
     // Main loop
     bool done = false;
@@ -84,67 +92,29 @@ int main(int, char**)
         // Poll and handle messages (inputs, window resize, etc.)
         // See the WndProc() function below for our to dispatch events to the Win32 backend.
         MSG msg;
-        while (::PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE))
+        BOOL ret;
+
+        if (g_repaintOnInput)
+            ret = ::GetMessage(&msg, NULL, 0U, 0U);
+        else
+            ret = ::PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE);
+
+        if (ret == 0)
+        {
+            RunPresentLoopOnce();
+        }
+        else if (ret == -1)
+        {
+            // possibly handle the error and exit
+            done = true;
+        }
+        else
         {
             ::TranslateMessage(&msg);
             ::DispatchMessage(&msg);
             if (msg.message == WM_QUIT)
                 done = true;
         }
-        if (done)
-            break;
-
-        // Start the Dear ImGui frame
-        ImGui_ImplDX11_NewFrame();
-        ImGui_ImplWin32_NewFrame();
-        ImGui::NewFrame();
-
-        // 1. Show the big demo window (Most of the sample code is in ImGui::ShowDemoWindow()! You can browse its code to learn more about Dear ImGui!).
-        if (show_demo_window)
-            ImGui::ShowDemoWindow(&show_demo_window);
-
-        // 2. Show a simple window that we create ourselves. We use a Begin/End pair to created a named window.
-        {
-            static float f = 0.0f;
-            static int counter = 0;
-
-            ImGui::Begin("Hello, world!");                          // Create a window called "Hello, world!" and append into it.
-
-            ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
-            ImGui::Checkbox("Demo Window", &show_demo_window);      // Edit bools storing our window open/close state
-            ImGui::Checkbox("Another Window", &show_another_window);
-
-            ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
-            ImGui::ColorEdit3("clear color", (float*)&clear_color); // Edit 3 floats representing a color
-
-            if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
-                counter++;
-            ImGui::SameLine();
-            ImGui::Text("counter = %d", counter);
-
-            ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
-            ImGui::End();
-        }
-
-        // 3. Show another simple window.
-        if (show_another_window)
-        {
-            ImGui::Begin("Another Window", &show_another_window);   // Pass a pointer to our bool variable (the window will have a closing button that will clear the bool when clicked)
-            ImGui::Text("Hello from another window!");
-            if (ImGui::Button("Close Me"))
-                show_another_window = false;
-            ImGui::End();
-        }
-
-        // Rendering
-        ImGui::Render();
-        const float clear_color_with_alpha[4] = { clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w };
-        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, NULL);
-        g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-
-        g_pSwapChain->Present(1, 0); // Present with vsync
-        //g_pSwapChain->Present(0, 0); // Present without vsync
     }
 
     // Cleanup
@@ -161,30 +131,132 @@ int main(int, char**)
 
 // Helper functions
 
+void RunPresentLoopOnce()
+{
+    // minimize output latency by waiting on the swapchain to be ready
+    if (WaitForSingleObject(g_pSwapChain->GetFrameLatencyWaitableObject(), INFINITE) != WAIT_OBJECT_0)
+        return;
+
+    // Our state
+    static bool show_demo_window = true;
+    static bool show_another_window = false;
+    static ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
+
+    // Start the Dear ImGui frame
+    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+
+    // 1. Show the big demo window (Most of the sample code is in ImGui::ShowDemoWindow()! You can browse its code to learn more about Dear ImGui!).
+    if (show_demo_window)
+        ImGui::ShowDemoWindow(&show_demo_window);
+
+    // 2. Show a simple window that we create ourselves. We use a Begin/End pair to created a named window.
+    {
+        static float f = 0.0f;
+        static int counter = 0;
+
+        ImGui::Begin("Hello, world!");                          // Create a window called "Hello, world!" and append into it.
+
+        ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
+        ImGui::Checkbox("Demo Window", &show_demo_window);      // Edit bools storing our window open/close state
+        ImGui::Checkbox("Another Window", &show_another_window);
+
+        ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
+        ImGui::ColorEdit3("clear color", (float*)&clear_color); // Edit 3 floats representing a color
+
+        if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
+            counter++;
+        ImGui::SameLine();
+        ImGui::Text("counter = %d", counter);
+
+        ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
+        ImGui::End();
+    }
+
+    // 3. Show another simple window.
+    if (show_another_window)
+    {
+        ImGui::Begin("Another Window", &show_another_window);   // Pass a pointer to our bool variable (the window will have a closing button that will clear the bool when clicked)
+        ImGui::Text("Hello from another window!");
+        if (ImGui::Button("Close Me"))
+            show_another_window = false;
+        ImGui::End();
+    }
+
+    // Rendering
+    ImGui::Render();
+    const float clear_color_with_alpha[4] = { clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w };
+    g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, NULL);
+    g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+    //g_pSwapChain->Present(1, 0); // Present with vsync
+    //g_pSwapChain->Present(0, 0); // Present without vsync
+
+    g_pSwapChain->Present(g_repaintOnInput ? 0 : 1, 0); // Present without vsync when input driven
+
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    if (io.MouseDrawCursor)
+    {
+        DXGI_FRAME_STATISTICS frame_stats;
+        g_pSwapChain->GetFrameStatistics(&frame_stats);
+
+        if (frame_stats.PresentCount > g_requestedDrawCursorOnFrame)
+        {
+            ::SetCursor(NULL);
+        }
+    }
+}
+
 bool CreateDeviceD3D(HWND hWnd)
 {
     // Setup swap chain
-    DXGI_SWAP_CHAIN_DESC sd;
+    DXGI_SWAP_CHAIN_DESC1 sd;
     ZeroMemory(&sd, sizeof(sd));
-    sd.BufferCount = 2;
-    sd.BufferDesc.Width = 0;
-    sd.BufferDesc.Height = 0;
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator = 60;
-    sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow = hWnd;
+    sd.Width = 0;
+    sd.Height = 0;
+    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.Stereo = FALSE;
     sd.SampleDesc.Count = 1;
     sd.SampleDesc.Quality = 0;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.Scaling = DXGI_SCALING_NONE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
     UINT createDeviceFlags = 0;
     //createDeviceFlags |= D3D11_CREATE_DEVICE_DEBUG;
     D3D_FEATURE_LEVEL featureLevel;
     const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
-    if (D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext) != S_OK)
+    if (D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext) != S_OK)
+        return false;
+
+    ComPtr<IDXGIDevice3> dxgiDevice;
+    if (g_pd3dDevice->QueryInterface(IID_PPV_ARGS(&dxgiDevice)) != S_OK)
+        return false;
+
+    ComPtr<IDXGIAdapter> dxgiAdapter;
+    if (dxgiDevice->GetAdapter(&dxgiAdapter) != S_OK)
+        return false;
+
+    ComPtr<IDXGIFactory2> dxgiFactory;
+    if (dxgiAdapter->GetParent(IID_PPV_ARGS(&dxgiFactory)) != S_OK)
+        return false;
+
+    ComPtr<IDXGISwapChain1> swapChain1;
+    if (dxgiFactory->CreateSwapChainForHwnd(g_pd3dDevice, hWnd, &sd, NULL, NULL, &swapChain1) != S_OK)
+        return false;
+
+    if (swapChain1->QueryInterface(IID_PPV_ARGS(&g_pSwapChain)) != S_OK)
+        return false;
+
+    if (g_pSwapChain->SetMaximumFrameLatency(1) != S_OK)
+        return false;
+
+    if (dxgiFactory->MakeWindowAssociation(hWnd, DXGI_MWA_NO_WINDOW_CHANGES) != S_OK)
         return false;
 
     CreateRenderTarget();
@@ -231,10 +303,81 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (g_pd3dDevice != NULL && wParam != SIZE_MINIMIZED)
         {
             CleanupRenderTarget();
-            g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+            g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
             CreateRenderTarget();
+
+            if (g_repaintOnInput)
+                RedrawWindow(hWnd, nullptr, nullptr, RDW_INTERNALPAINT);
         }
         return 0;
+    case WM_LBUTTONUP:
+    case WM_MBUTTONUP:
+    case WM_RBUTTONUP:
+    case WM_XBUTTONUP:
+    {
+        ++g_requestedDrawCursor;
+
+        ImGuiIO& io = ImGui::GetIO();
+        io.MouseDrawCursor = g_requestedDrawCursor != 0;
+
+        if (g_repaintOnInput)
+            RedrawWindow(hWnd, nullptr, nullptr, RDW_INTERNALPAINT);
+
+        break;
+    }
+    case WM_LBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_XBUTTONDOWN:
+    {
+        --g_requestedDrawCursor;
+
+        ImGuiIO& io = ImGui::GetIO();
+        bool wantDrawCursor = g_requestedDrawCursor != 0;
+
+        if (io.MouseDrawCursor ^ wantDrawCursor)
+        {
+            io.MouseDrawCursor = wantDrawCursor;
+
+            if (wantDrawCursor)
+            {
+                DXGI_FRAME_STATISTICS frame_stats;
+                g_pSwapChain->GetFrameStatistics(&frame_stats);
+
+                g_requestedDrawCursorOnFrame = frame_stats.PresentCount + 3;
+            }
+        }
+        io.MouseDrawCursor = wantDrawCursor;
+
+        if (g_repaintOnInput)
+            RedrawWindow(hWnd, nullptr, nullptr, RDW_INTERNALPAINT);
+
+        break;
+    }
+    case WM_MOUSEACTIVATE:
+    case WM_MOUSEMOVE:
+    case WM_MOUSEWHEEL:
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+
+        if (g_repaintOnInput)
+            RedrawWindow(hWnd, nullptr, nullptr, RDW_INTERNALPAINT);
+
+        break;
+    case WM_PAINT:
+    {
+        if (!g_presentLoopReady)
+        {
+            InvalidateRect(hWnd, nullptr, false);
+            break;
+        }
+
+        RunPresentLoopOnce();
+
+        ValidateRect(hWnd, nullptr);
+
+        return 0;
+    }
     case WM_SYSCOMMAND:
         if ((wParam & 0xfff0) == SC_KEYMENU) // Disable ALT application menu
             return 0;
